@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/check_console_project.py\" || python \"${CLAUDE_PLUGIN_ROOT}/scripts/check_console_project.py\"",
+            "timeout": 15,
+            "statusMessage": "Checking this is a console project..."
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "select-promptplus-control",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/check_console_project.py\" || python \"${CLAUDE_PLUGIN_ROOT}/scripts/check_console_project.py\"",
+            "timeout": 15,
+            "statusMessage": "Checking this is a console project..."
+          }
+        ]
+      }
+    ]
+  }
+}

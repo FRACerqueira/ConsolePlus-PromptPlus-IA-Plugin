@@ -1,0 +1,13 @@
+{
+  "name": "consoleplus-promptplus",
+  "displayName": "ConsolePlus + PromptPlus",
+  "description": "Helps choose and implement the right ConsolePlus/PromptPlus control for .NET console applications - layer selection, non-interactive fallbacks, control disambiguation, and best-practice implementation, loaded on demand per control.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Fernando Cerqueira"
+  },
+  "homepage": "https://github.com/FRACerqueira/ConsolePlus-PromptPlus-Claude-Plugin",
+  "repository": "https://github.com/FRACerqueira/ConsolePlus-PromptPlus-Claude-Plugin",
+  "license": "MIT",
+  "keywords": ["console", "cli", "promptplus", "consoleplus", "dotnet", "interactive-controls"]
+}

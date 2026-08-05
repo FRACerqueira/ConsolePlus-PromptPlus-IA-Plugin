@@ -1,0 +1,19 @@
+{
+  "name": "consoleplus-promptplus-tools",
+  "owner": {
+    "name": "Fernando Cerqueira"
+  },
+  "description": "Claude Code tooling for choosing and implementing ConsolePlus/PromptPlus controls in .NET console applications.",
+  "plugins": [
+    {
+      "name": "consoleplus-promptplus",
+      "source": "./",
+      "description": "Helps choose and implement the right ConsolePlus/PromptPlus control for .NET console applications.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Fernando Cerqueira"
+      },
+      "license": "MIT"
+    }
+  ]
+}

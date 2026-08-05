@@ -1,3 +1,7 @@
+# This plugin's own ignores
+.claude/settings.local.json
+.vs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
