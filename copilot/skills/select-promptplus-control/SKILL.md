@@ -1,8 +1,13 @@
 ---
 name: select-promptplus-control
-description: Use when building or modifying a .NET console application that uses, or could use, ConsolePlus and/or PromptPlus - to decide which library layer fits the need, whether an interactive control can even run in the target execution context, which of PromptPlus's 21 controls is the right fit, and how to implement it using that control's actual fluent API. Triggers on requests like "add a menu/prompt/progress bar/date picker to this console app", "which PromptPlus control should I use for X", "is this safe to run under CI or redirected input", "pick between ConsolePlus and PromptPlus", "how do I validate/mask/page this input", or any interactive console input/output design question in a .NET project. Only applies to console-type projects (an entry point with OutputType Exe, not WinExe) - not web apps, not WinForms/WPF apps, not libraries with no console entry point; a companion hook enforces this, but check the entry point yourself if the hook isn't installed. Supports PromptPlus 6.0+ only (its 5.x line is being discontinued) - a project on an older PromptPlus gets a plain upgrade notice for PromptPlus.Controls guidance, not degraded fallback guidance; ConsolePlus itself has no such floor.
-allowed-tools: Bash, Read, Glob, Grep, WebFetch
+description: Use when building or modifying a .NET console application that uses, or could use, ConsolePlus and/or PromptPlus - to decide which library layer fits the need, whether an interactive control can even run in the target execution context, which of PromptPlus's 21 controls is the right fit, and how to implement it using that control's actual fluent API. Triggers on requests like "add a menu/prompt/progress bar/date picker to this console app", "which PromptPlus control should I use for X", "is this safe to run under CI or redirected input", "pick between ConsolePlus and PromptPlus", "how do I validate/mask/page this input", or any interactive console input/output design question in a .NET project. Only applies to console-type projects (an entry point with OutputType Exe, not WinExe) - not web apps, not WinForms/WPF apps, not libraries with no console entry point; on GitHub Copilot there is no companion hook to enforce this, so always check the entry point yourself. Supports PromptPlus 6.0+ only (its 5.x line is being discontinued) - a project on an older PromptPlus gets a plain upgrade notice for PromptPlus.Controls guidance, not degraded fallback guidance; ConsolePlus itself has no such floor.
+allowed-tools: Bash Read Glob Grep WebFetch
+compatibility: Requires this plugin's scripts/ directory (resolve_package_version.py, fetch_doc.py, check_console_project.py) copied alongside this skill (or otherwise reachable at the relative paths used below) - see this repo's README, GitHub Copilot section.
+metadata:
+  ported-from: skills/select-promptplus-control/SKILL.md (Claude Code plugin, canonical source)
 ---
+
+> Ported from this repo's Claude Code skill (`skills/select-promptplus-control/SKILL.md`). Content is functionally identical except where adapted for the GitHub Copilot / Agent Skills open standard (agentskills.io/specification): `allowed-tools` syntax; the `WebFetch` → `fetch` tool references (this mapping is this plugin's own best guess, unlike the other Claude→Copilot tool mappings used in `copilot/agents/`, which were checked against Copilot's actual built-in tools - see this repo's README); the frontmatter `description`'s hook clause, since Copilot has no hook mechanism at all (not just "sometimes not installed"); and the "Scope check" section below, which also documents `check_console_project.py`'s plain `{"decision", "reason"}` output when run outside a Claude Code hook. Script invocation paths (`scripts/...py`) are deliberately left as plain relative paths here, unlike the canonical Claude version's `${CLAUDE_PLUGIN_ROOT}`-prefixed paths - `${CLAUDE_PLUGIN_ROOT}` is a Claude Code-specific environment variable with no Copilot equivalent, which is exactly why this repo's README tells you to copy `scripts/` to your repo root: these paths resolve from there. There is no generator yet: if the canonical Claude version changes, re-sync this file by hand. **Last synced: 2026-08-07.**
 
 # Choosing and implementing ConsolePlus / PromptPlus controls
 
@@ -27,7 +32,7 @@ entirely - see the hard-stop rule below, not a degraded fallback. There is no "p
 older docs" path anymore.
 
 Every doc fetch in this skill (Steps 1, 2, 4, 5) goes through `scripts/fetch_doc.py`, not a direct
-WebFetch call - WebFetch runs page content through a small model with a prompt and returns *that
+`fetch` tool call - `fetch` runs page content through a small model with a prompt and returns *that
 model's response*, which is fine for "summarize this page" but risks paraphrasing away exact method
 signatures and table contents on a reference page. `fetch_doc.py` `curl`s the raw file, caches it
 locally keyed by repo+ref+path (a tag's content never changes, so a cache hit is exactly as correct
@@ -37,12 +42,12 @@ which *does* move over time and is re-resolved to its current commit on a short 
 cached under the branch name forever.
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/resolve_package_version.py" \
+python scripts/resolve_package_version.py \
   --package-id PromptPlus --repo FRACerqueira/PromptPlus \
   --project-path <consumer.csproj or Directory.Packages.props> \
   --docs-probe-path docs/controls --min-major-version 6
 
-python "${CLAUDE_PLUGIN_ROOT}/scripts/resolve_package_version.py" \
+python scripts/resolve_package_version.py \
   --package-id ConsolePlus.net --repo FRACerqueira/ConsolePlus \
   --project-path <consumer.csproj or Directory.Packages.props> \
   --docs-probe-path docs/promptplus.md
@@ -92,10 +97,10 @@ Read the JSON result (or its absence) in this order:
    (`latest_acceptable_version` can no longer be a worse-documented release than what's installed).
 
 If `python`/`python3` isn't available in this environment, say so, skip this step, and fall back to
-WebFetch directly on the raw GitHub URL from `main` for Steps 1, 2, 4, 5 - degraded (no version pin,
-and WebFetch's summarize-through-a-small-model behavior risks losing exact signatures/tables, see
-the fidelity note above) but still better than guessing from memory alone. Say plainly that both
-degradations apply when this happens.
+the `fetch` tool directly on the raw GitHub URL from `main` for Steps 1, 2, 4, 5 - degraded (no
+version pin, and the `fetch` tool's summarize-through-a-small-model behavior risks losing exact
+signatures/tables, see the fidelity note above) but still better than guessing from memory alone.
+Say plainly that both degradations apply when this happens.
 
 ## Step 1 - Which layer: ConsolePlus, the two `IWidgets`, or `PromptPlus.Controls`
 
@@ -119,7 +124,7 @@ to the code being written.
 For anything beyond this table, fetch ConsolePlus's positioning doc pinned to ConsolePlus's
 `docs_tag`:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/fetch_doc.py" --repo FRACerqueira/ConsolePlus --ref <docs_tag> --path docs/promptplus.md
+python scripts/fetch_doc.py --repo FRACerqueira/ConsolePlus --ref <docs_tag> --path docs/promptplus.md
 ```
 then Read the printed `path`.
 
@@ -153,7 +158,7 @@ that context.
 For deeper detail (exact exemption logic, Demo Mode interaction), only if `docs_structure` is
 `"structured"`:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/fetch_doc.py" --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/global-behaviors.md
+python scripts/fetch_doc.py --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/global-behaviors.md
 ```
 then Read the printed `path`.
 
@@ -233,9 +238,9 @@ You should only reach this step with `docs_structure: "structured"` - Step 0's r
 `PromptPlus.Controls` guidance before this point whenever the installed version is below 6.0. For
 each file, pinned to `docs_tag`:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/fetch_doc.py" --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/controls/<control>/index.md
-python "${CLAUDE_PLUGIN_ROOT}/scripts/fetch_doc.py" --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/controls/<control>/methods.md
-python "${CLAUDE_PLUGIN_ROOT}/scripts/fetch_doc.py" --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/controls/<control>/operations.md
+python scripts/fetch_doc.py --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/controls/<control>/index.md
+python scripts/fetch_doc.py --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/controls/<control>/methods.md
+python scripts/fetch_doc.py --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/controls/<control>/operations.md
 ```
 then Read each printed `path`. `<control>` is the lowercase directory name (`select`, `maskedit`,
 `tablemultiselect`, ...), not the C# type name. Fetch `styles.md` too only if the user asks about
@@ -262,7 +267,7 @@ Apply regardless of which control was chosen:
 
 For the full property/behavior reference, only if `docs_structure` is `"structured"`:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/fetch_doc.py" --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/global-behaviors.md
+python scripts/fetch_doc.py --repo FRACerqueira/PromptPlus --ref <docs_tag> --path docs/global-behaviors.md
 ```
 then Read the printed `path` (same cached file Step 2 may have already fetched - no duplicate cost).
 
@@ -271,10 +276,16 @@ then Read the printed `path` (same cached file Step 2 may have already fetched -
 This skill applies to console-type .NET projects only (an entry point with
 `<OutputType>Exe</OutputType>`, not `WinExe` - that's the conventional `OutputType` for WinForms/WPF
 apps and is deliberately treated as out of scope, see `check_console_project.py`'s
-`is_console_entry` - and not `Microsoft.NET.Sdk.Web`). `hooks/hooks.json` +
-`scripts/check_console_project.py` enforce this deterministically before the skill can even be
-invoked. If that hook isn't installed for some reason, check the entry point yourself as a fallback -
-walk up from the current project to find the one actually run (`dotnet run`), not necessarily the
-csproj currently open, since a class library with no `OutputType` hosting PromptPlus calls but
-consumed by a console `Exe` is a legitimate case. If no console entry point is reachable, say this
-skill doesn't apply and stop.
+`is_console_entry` - and not `Microsoft.NET.Sdk.Web`). The Claude Code build of this plugin has a
+companion hook (`hooks/hooks.json` + `scripts/check_console_project.py`) that enforces this
+deterministically before the skill can even be invoked - **GitHub Copilot has no equivalent hook
+mechanism**, so this check is always your responsibility here, not just a fallback. Walk up from the
+current project to find the one actually run (`dotnet run`), not necessarily the csproj currently
+open, since a class library with no `OutputType` hosting PromptPlus calls but consumed by a console
+`Exe` is a legitimate case. If you copied `scripts/check_console_project.py` alongside this skill
+(see this repo's README, GitHub Copilot section), you can also run it directly via the
+`runCommands` tool: with no Claude Code hook payload on stdin, it prints a plain
+`{"decision": "allow"|"deny"|"ask", "reason": "..."}` result (instead of the Claude-specific hook
+envelope it emits when Claude Code itself invokes it as a hook) - read `decision` directly rather
+than treating silence as "allow" or any output at all as "deny". Otherwise apply the rule manually.
+If no console entry point is reachable, say this skill doesn't apply and stop.

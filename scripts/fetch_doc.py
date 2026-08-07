@@ -28,42 +28,45 @@ any tag.
 
 import argparse
 import json
-import os
 import sys
 import time
 import urllib.error
-import urllib.request
 from pathlib import Path
 
-USER_AGENT = "consoleplus-promptplus-claude-plugin/0.1.0"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _http import default_cache_dir, github_headers, http_get  # noqa: E402
+
 RAW_URL = "https://raw.githubusercontent.com/{repo}/{ref}/{path}"
 COMMIT_API_URL = "https://api.github.com/repos/{repo}/commits/{ref}"
 
 
-def default_cache_dir():
-    env_override = os.environ.get("CONSOLEPLUS_PROMPTPLUS_DOC_CACHE")
-    if env_override:
-        return Path(env_override)
-    xdg = os.environ.get("XDG_CACHE_HOME")
-    if xdg:
-        return Path(xdg) / "consoleplus-promptplus-claude-plugin"
-    if sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
-        return Path(os.environ["LOCALAPPDATA"]) / "consoleplus-promptplus-claude-plugin" / "doc-cache"
-    return Path.home() / ".cache" / "consoleplus-promptplus-claude-plugin"
+def safe_join(base_dir, *parts):
+    """Joins `parts` under `base_dir`, refusing to resolve outside it.
 
-
-def http_get(url, headers=None, as_json=False):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        raw = resp.read()
-        return json.loads(raw.decode("utf-8")) if as_json else raw
+    pathlib's `/`/`joinpath` silently discards everything to its left when a
+    later component is itself absolute, and doesn't collapse `..` segments
+    before touching the filesystem - so a caller-supplied --repo/--ref/--path
+    value containing an absolute path or `..` segments could otherwise make
+    this script read or write far outside its own cache directory. Every
+    part must resolve to a location inside `base_dir`, or this raises.
+    """
+    base = base_dir.resolve()
+    candidate = base.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise SystemExit(
+            f"Refusing to resolve outside the cache directory ({base}): {candidate} "
+            f"- check --repo/--ref/--path for an absolute path or '..' segment."
+        )
+    return candidate
 
 
 def resolve_mutable_ref(repo, ref, cache_dir, refresh_minutes, github_token=None):
     """Resolves a mutable ref (e.g. "main") to a commit SHA, cached with a TTL
     so repeated calls within one session don't re-hit the API each time.
     """
-    ref_cache_file = cache_dir / repo / "_refs" / f"{ref}.json"
+    ref_cache_file = safe_join(cache_dir, repo, "_refs", f"{ref}.json")
     if ref_cache_file.exists():
         try:
             record = json.loads(ref_cache_file.read_text(encoding="utf-8"))
@@ -73,9 +76,7 @@ def resolve_mutable_ref(repo, ref, cache_dir, refresh_minutes, github_token=None
         except (json.JSONDecodeError, KeyError, OSError):
             pass  # fall through and re-resolve
 
-    headers = {"Accept": "application/vnd.github+json"}
-    if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
+    headers = github_headers(github_token)
     try:
         data = http_get(COMMIT_API_URL.format(repo=repo, ref=ref), headers=headers, as_json=True)
     except urllib.error.HTTPError as e:
@@ -107,7 +108,7 @@ def main():
     else:
         resolved_ref = args.ref
 
-    local_path = cache_dir / args.repo / resolved_ref / args.path
+    local_path = safe_join(cache_dir, args.repo, resolved_ref, args.path)
     cached = local_path.exists()
 
     if not cached:
@@ -120,8 +121,12 @@ def main():
         except urllib.error.URLError as e:
             print(json.dumps({"error": f"{e.reason} fetching {url}"}))
             sys.exit(1)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(content)
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(content)
+        except OSError as e:
+            print(json.dumps({"error": f"Could not write '{local_path}': {e}"}))
+            sys.exit(1)
 
     print(json.dumps({
         "cached": cached,

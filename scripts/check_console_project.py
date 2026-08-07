@@ -22,12 +22,21 @@ the current directory's .csproj, because a class library with no OutputType
 that hosts PromptPlus/ConsolePlus calls, but is referenced by a console Exe
 elsewhere in the same solution/repo, is a legitimate case this gate must not
 reject.
+
+Also runnable directly (not as a hook) - e.g. GitHub Copilot's `runCommands`
+tool has no hook runtime to call this script for it, so the Copilot port of
+select-promptplus-control's SKILL.md tells the assistant to run it by hand
+instead. With no `hook_event_name` on stdin (or no stdin at all), `main()`
+detects that and prints a plain `{"decision": "allow"|"deny"|"ask", "reason":
+...}` result instead of the Claude Code hook envelope below, which nothing
+outside a real hook runtime knows how to interpret.
 """
 
 import json
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -41,16 +50,52 @@ NON_CONSOLE_SDKS = {
 }
 EXCLUDED_DIR_NAMES = {"bin", "obj", "node_modules", ".git"}
 
+# A .csproj bigger than this is almost certainly not a hand-written project
+# file - skip it rather than hand an unbounded file to ET.parse (which has no
+# built-in protection against a maliciously crafted entity-expansion bomb).
+MAX_CSPROJ_BYTES = 5 * 1024 * 1024
+
+# Backstops for evaluate()'s filesystem walk. A brand-new project created
+# outside a git repo with no .sln yet (a real, doc-supported scenario for
+# this plugin) makes find_scope_root fall all the way back to start_dir, and
+# find_all_csproj then walks the whole tree from there - on a very deep or
+# very wide directory (or, pathologically, the filesystem root), that walk
+# could otherwise run past the hook's own 15s timeout in hooks/hooks.json.
+MAX_SCOPE_WALK_DEPTH = 60
+MAX_SCAN_SECONDS = 8
+MAX_SCAN_DIRS = 20000
+
+
+class ScanTooLarge(Exception):
+    """Raised when find_all_csproj gives up rather than risk hanging past the
+    hook's timeout - evaluate() turns this into "ask" (escalate to a human
+    with a narrower directory), never a silent "deny" or a silent partial
+    scan that could wrongly reject a legitimate console project."""
+
 
 def strip_ns(tag):
     return tag.rsplit("}", 1)[-1]
 
 
 def parse_csproj(path):
-    """Returns a dict describing the project, or None if unparseable."""
+    """Returns a dict describing the project, or None if unparseable.
+
+    OutputType (and the two GUI flags) are read PropertyGroup-by-PropertyGroup
+    rather than via one flat root.iter() pass, so that a value from an
+    unconditioned <PropertyGroup> (no Condition="..." attribute - the normal,
+    always-applies case) always wins over one from a conditioned group (e.g.
+    a per-TargetFramework or per-Configuration override), instead of just
+    "whichever element appears last in the file". This plugin does not
+    evaluate MSBuild Condition expressions - a conditioned-only project still
+    falls back to "last one wins" among those, since there's no way to know
+    which condition would actually be true at build time without a real
+    MSBuild evaluation.
+    """
     try:
+        if path.stat().st_size > MAX_CSPROJ_BYTES:
+            return None
         root = ET.parse(path).getroot()
-    except ET.ParseError:
+    except (ET.ParseError, OSError):
         return None
 
     sdk = (root.attrib.get("Sdk") or "").strip().lower()
@@ -63,16 +108,27 @@ def parse_csproj(path):
         "has_aspnetcore_frameworkref": False,
         "project_references": [],
     }
+
+    output_type_is_conditioned = True  # nothing set yet - let the first hit win regardless
+    for pg in root.iter():
+        if strip_ns(pg.tag) != "PropertyGroup":
+            continue
+        is_conditioned = "Condition" in pg.attrib
+        for el in pg:
+            child_tag = strip_ns(el.tag)
+            text = (el.text or "").strip()
+            if child_tag == "OutputType" and text:
+                if info["output_type"] is None or (output_type_is_conditioned and not is_conditioned):
+                    info["output_type"] = text.lower()
+                    output_type_is_conditioned = is_conditioned
+            elif child_tag == "UseWindowsForms" and text.lower() == "true":
+                info["use_winforms"] = True
+            elif child_tag == "UseWPF" and text.lower() == "true":
+                info["use_wpf"] = True
+
     for el in root.iter():
         tag = strip_ns(el.tag)
-        text = (el.text or "").strip()
-        if tag == "OutputType" and text:
-            info["output_type"] = text.lower()
-        elif tag == "UseWindowsForms" and text.lower() == "true":
-            info["use_winforms"] = True
-        elif tag == "UseWPF" and text.lower() == "true":
-            info["use_wpf"] = True
-        elif tag == "FrameworkReference":
+        if tag == "FrameworkReference":
             include = el.attrib.get("Include", "")
             if include.strip().lower() == "microsoft.aspnetcore.app":
                 info["has_aspnetcore_frameworkref"] = True
@@ -83,9 +139,26 @@ def parse_csproj(path):
     return info
 
 
-def normalize_ref(csproj_path, include_value):
-    """Resolves a <ProjectReference Include="..."/> path to an absolute, normalized path."""
-    ref_path = (csproj_path.parent / include_value.replace("\\", "/")).resolve()
+def normalize_ref(csproj_path, include_value, solution_dir=None):
+    """Resolves a <ProjectReference Include="..."/> path to an absolute, normalized path.
+
+    Only the `$(SolutionDir)` MSBuild macro is expanded (a common pattern in
+    larger, multi-project solutions) - `solution_dir` is the directory
+    find_scope_root actually resolved (the one holding the .sln/.slnx, when
+    one was found). Any other macro (a custom MSBuild property, etc.) is left
+    as literal text, same as before this function existed - it simply won't
+    match a real file's resolved path, which is a harmless miss (no reverse-
+    dependency edge added for it), not a crash or a false positive.
+    """
+    value = include_value.replace("\\", "/")
+    if solution_dir is not None:
+        value = re.sub(
+            r"\$\(SolutionDir\)",
+            str(solution_dir).rstrip("/\\") + "/",
+            value,
+            flags=re.IGNORECASE,
+        )
+    ref_path = (csproj_path.parent / value).resolve()
     return ref_path
 
 
@@ -100,7 +173,10 @@ def is_console_entry(info):
     """
     if info is None or info["output_type"] != "exe":
         return False
-    if info["sdk"] in NON_CONSOLE_SDKS:
+    # Sdk="A;B" (combining multiple SDKs) is valid MSBuild syntax - split
+    # before membership-checking rather than comparing the whole string.
+    sdk_parts = {part.strip() for part in info["sdk"].split(";") if part.strip()}
+    if sdk_parts & NON_CONSOLE_SDKS:
         return False
     if info["use_winforms"] or info["use_wpf"]:
         return False
@@ -120,6 +196,7 @@ def find_scope_root(start_dir):
     """
     current = start_dir
     git_root = None
+    depth = 0
     while True:
         try:
             entries = list(current.iterdir())
@@ -135,13 +212,25 @@ def find_scope_root(start_dir):
         parent = current.parent
         if parent == current:
             break
+        depth += 1
+        if depth > MAX_SCOPE_WALK_DEPTH:
+            break  # pathological mount/symlink depth - stop climbing, fall back below
         current = parent
     return (git_root or start_dir), []
 
 
 def find_all_csproj(scope_root):
     results = []
+    deadline = time.monotonic() + MAX_SCAN_SECONDS
+    dirs_visited = 0
     for dirpath, dirnames, filenames in os.walk(scope_root):
+        dirs_visited += 1
+        if dirs_visited > MAX_SCAN_DIRS or time.monotonic() > deadline:
+            raise ScanTooLarge(
+                f"Directory tree under {scope_root} is too large to scan reliably "
+                f"(stopped after {dirs_visited} directories) for '{SKILL_NAME}' - "
+                f"re-run from a more specific project directory."
+            )
         dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_NAMES]
         for f in filenames:
             if f.lower().endswith(".csproj"):
@@ -168,7 +257,7 @@ def find_local_project(cwd, scope_root):
     return None
 
 
-def project_reachable_from_console(local_path, all_projects_by_path):
+def project_reachable_from_console(local_path, all_projects_by_path, solution_dir=None):
     """BFS over the reverse ProjectReference graph: is `local_path` itself a console
     entry, or is it (transitively) referenced by some project that is?
     """
@@ -179,7 +268,7 @@ def project_reachable_from_console(local_path, all_projects_by_path):
     reverse_deps = {}
     for proj_path, info in all_projects_by_path.items():
         for raw_ref in info["project_references"]:
-            target = normalize_ref(proj_path, raw_ref)
+            target = normalize_ref(proj_path, raw_ref, solution_dir=solution_dir)
             reverse_deps.setdefault(target, []).append(proj_path)
 
     visited = {local_path}
@@ -215,7 +304,10 @@ def evaluate(cwd_str):
             f"or re-run from a more specific project directory."
         )
 
-    csproj_paths = find_all_csproj(scope_root)
+    try:
+        csproj_paths = find_all_csproj(scope_root)
+    except ScanTooLarge as exc:
+        return "ask", str(exc)
 
     if not csproj_paths:
         return "deny", (
@@ -235,7 +327,7 @@ def evaluate(cwd_str):
         local_resolved = local_project.resolve()
         if local_resolved not in all_projects_by_path:
             return "deny", f"Could not parse {local_project} as a .csproj."
-        if project_reachable_from_console(local_resolved, all_projects_by_path):
+        if project_reachable_from_console(local_resolved, all_projects_by_path, solution_dir=scope_root):
             return "allow", None
         return "deny", (
             f"'{local_project.name}' is not a console entry point (OutputType Exe, non-web/GUI SDK) "
@@ -255,13 +347,27 @@ def evaluate(cwd_str):
     )
 
 
-def main():
-    try:
-        raw = sys.stdin.read()
-        payload = json.loads(raw) if raw.strip() else {}
-    except (json.JSONDecodeError, OSError):
-        payload = {}
+def read_stdin_payload():
+    """Reads and parses the hook JSON payload from stdin, or {} if there is
+    none to read.
 
+    Skips the read entirely when stdin is a live terminal (isatty()) - a
+    manual/direct invocation of this script (no pipe, no redirect) would
+    otherwise block forever on sys.stdin.read() waiting for input that will
+    never arrive, since nothing is going to close or redirect that terminal's
+    stdin for us.
+    """
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        raw = sys.stdin.read()
+        return json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def main():
+    payload = read_stdin_payload()
     event = payload.get("hook_event_name") or ""
 
     if event == "PreToolUse":
@@ -272,8 +378,19 @@ def main():
     cwd = payload.get("cwd") or os.getcwd()
     decision, reason = evaluate(cwd)
 
+    if not event:
+        # No Claude Code hook event name on stdin - this is a direct/manual
+        # invocation (GitHub Copilot's runCommands tool, or a human running
+        # this script by hand), not a hook callback. Always print a plain,
+        # tool-agnostic result - including on "allow", which the real hook
+        # path below deliberately leaves silent - since there is no hook
+        # runtime here to infer a meaning from silence or from the
+        # Claude-Code-specific envelope used below.
+        print(json.dumps({"decision": decision, "reason": reason}))
+        return
+
     if decision == "allow":
-        return  # silent allow, exit 0
+        return  # silent allow, exit 0 - Claude Code hook contract
 
     if decision == "ask" and event == "PreToolUse":
         # "ask" (surface the normal permission prompt to the actual user) is

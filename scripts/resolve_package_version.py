@@ -32,36 +32,41 @@ import argparse
 import json
 import re
 import sys
+import time
 import urllib.error
-import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _http import default_cache_dir, github_headers, http_get_json  # noqa: E402
 
 NUGET_INDEX_URL = "https://api.nuget.org/v3-flatcontainer/{package_id}/index.json"
 GITHUB_TAGS_URL = "https://api.github.com/repos/{repo}/tags"
-USER_AGENT = "consoleplus-promptplus-claude-plugin/0.1.0"
 MAX_TAG_PAGES = 10  # safety bound: 10 * 100 = up to 1000 tags scanned
 
-VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)\.?(\d*))?$")
+# 4th segment (a legacy but still-valid NuGet revision component, e.g.
+# "1.0.0.0") is optional and defaults to 0 when absent - kept out of most
+# real ConsolePlus/PromptPlus releases, but a version string using it should
+# be compared/sorted correctly rather than silently dropped from the
+# candidate pool.
+VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?(?:-([A-Za-z]+)\.?(\d*))?$")
 ACCEPTABLE_LABEL_RE = re.compile(r"^rc$", re.IGNORECASE)
 
 
-def http_get_json(url, headers=None):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8")), resp.headers
-
-
 def parse_version(version):
-    """Returns (major, minor, patch, label_lower, num) or None if unparseable."""
+    """Returns (major, minor, patch, revision, label_lower, num) or None if unparseable."""
     m = VERSION_RE.match(version)
     if not m:
         return None
-    major, minor, patch, label, num = m.groups()
-    return int(major), int(minor), int(patch), (label or "").lower(), int(num) if num else 0
+    major, minor, patch, revision, label, num = m.groups()
+    return (
+        int(major), int(minor), int(patch), int(revision) if revision else 0,
+        (label or "").lower(), int(num) if num else 0,
+    )
 
 
 def is_acceptable(parsed, min_major=None):
-    major, _, _, label, _ = parsed
+    major, _, _, _, label, _ = parsed
     if min_major is not None and major < min_major:
         return False
     return label == "" or ACCEPTABLE_LABEL_RE.match(label)
@@ -72,7 +77,7 @@ def rejection_reason(parsed, min_major=None):
     than a single catch-all "not accepted" bucket - "your install predates the
     minimum this plugin supports" is a different, more actionable fact than
     "your install is a rejected prerelease label"."""
-    major, _, _, label, _ = parsed
+    major, _, _, _, label, _ = parsed
     if min_major is not None and major < min_major:
         return "below-minimum-major"
     if not (label == "" or ACCEPTABLE_LABEL_RE.match(label)):
@@ -81,10 +86,10 @@ def rejection_reason(parsed, min_major=None):
 
 
 def sort_key(parsed):
-    major, minor, patch, label, num = parsed
-    # Within the same major.minor.patch, a stable release outranks any -rc build.
+    major, minor, patch, revision, label, num = parsed
+    # Within the same major.minor.patch(.revision), a stable release outranks any -rc build.
     is_stable = 1 if label == "" else 0
-    return (major, minor, patch, is_stable, num)
+    return (major, minor, patch, revision, is_stable, num)
 
 
 def fetch_nuget_versions(package_id):
@@ -110,11 +115,30 @@ def latest_acceptable_version(versions, min_major=None):
     return candidates[-1][1]
 
 
-def fetch_github_tags(repo, github_token=None):
+def fetch_github_tags(repo, cache_dir=None, cache_minutes=15, github_token=None):
+    """Fetches every tag for `repo`, cached with a short TTL.
+
+    Without a cache, this plugin's own SKILL.md calls this function at least
+    twice per session (once for PromptPlus, once for ConsolePlus.net) - each
+    call can page through up to MAX_TAG_PAGES*100 tags, which burns through
+    the unauthenticated GitHub API's 60 req/hour limit fast. A short TTL
+    (default 15 minutes) is enough to dedupe repeat calls within one working
+    session without risking a long-stale tag list once a new release lands.
+    """
+    cache_file = None
+    if cache_dir is not None and cache_minutes > 0:
+        cache_file = cache_dir / repo / "_tags.json"
+        if cache_file.exists():
+            try:
+                record = json.loads(cache_file.read_text(encoding="utf-8"))
+                age_minutes = (time.time() - record["fetched_at"]) / 60
+                if age_minutes < cache_minutes:
+                    return record["tags"]
+            except (json.JSONDecodeError, KeyError, OSError):
+                pass  # fall through and re-fetch
+
     tags = []
-    headers = {"Accept": "application/vnd.github+json"}
-    if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
+    headers = github_headers(github_token)
     page = 1
     while page <= MAX_TAG_PAGES:
         url = GITHUB_TAGS_URL.format(repo=repo) + f"?per_page=100&page={page}"
@@ -130,6 +154,13 @@ def fetch_github_tags(repo, github_token=None):
         if len(data) < 100:
             break
         page += 1
+
+    if cache_file is not None:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps({"tags": tags, "fetched_at": time.time()}), encoding="utf-8")
+        except OSError:
+            pass  # caching is an optimization, not required for correctness
     return tags
 
 
@@ -164,9 +195,7 @@ def probe_docs_structure(repo, tag, probe_path, github_token=None):
     """
     if tag is None or probe_path is None:
         return "unknown"
-    headers = {"Accept": "application/vnd.github+json"}
-    if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
+    headers = github_headers(github_token)
     url = f"https://api.github.com/repos/{repo}/contents/{probe_path}?ref={tag}"
     try:
         http_get_json(url, headers=headers)
@@ -177,6 +206,43 @@ def probe_docs_structure(repo, tag, probe_path, github_token=None):
         raise SystemExit(f"Docs-structure probe failed for '{repo}'@{tag}: HTTP {e.code}")
     except urllib.error.URLError as e:
         raise SystemExit(f"Docs-structure probe failed for '{repo}'@{tag}: {e.reason}")
+
+
+def _strip_ns(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _resolve_installed_version_from_text(package_id, text):
+    """Attribute-order-independent fallback for a project file that isn't
+    well-formed XML (so ElementTree can't parse it) - matches the whole
+    opening tag first, then looks for Include=/Version= within it in
+    either order, instead of hard-coding "Include before Version" the way a
+    single combined regex would. MSBuild itself doesn't care about attribute
+    order, so a scanner that does silently misses valid, installed packages.
+    """
+    def find_attr_pair(tag_name):
+        for m in re.finditer(rf"<{tag_name}\b([^>]*?)/?>", text, re.IGNORECASE):
+            attrs = m.group(1)
+            include_m = re.search(r'Include\s*=\s*"([^"]*)"', attrs, re.IGNORECASE)
+            version_m = re.search(r'Version\s*=\s*"([^"]*)"', attrs, re.IGNORECASE)
+            if include_m and version_m and include_m.group(1).strip().lower() == package_id.lower():
+                return version_m.group(1)
+        return None
+
+    result = find_attr_pair("PackageReference")
+    if result:
+        return result
+    result = find_attr_pair("PackageVersion")
+    if result:
+        return result
+
+    id_pattern = re.compile(r"<PackageId>\s*([^<\s]+)\s*</PackageId>", re.IGNORECASE)
+    id_match = id_pattern.search(text)
+    if id_match and id_match.group(1).strip().lower() == package_id.lower():
+        version_match = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", text, re.IGNORECASE)
+        if version_match:
+            return version_match.group(1)
+    return None
 
 
 def resolve_installed_version(package_id, project_path):
@@ -191,31 +257,48 @@ def resolve_installed_version(package_id, project_path):
          <PackageId> equals package_id. Covers running this script inside
          ConsolePlus-PromptPlus itself, where samples use ProjectReference and
          there is no PackageReference to scan at all.
+
+    Parses as real XML first (so attribute order, e.g. Version before
+    Include, never causes a false "nothing installed") and only falls back
+    to an order-independent regex scan if the file isn't well-formed XML.
     """
-    text = Path(project_path).read_text(encoding="utf-8")
-    pattern = re.compile(
-        rf'<PackageReference\s+Include="{re.escape(package_id)}"\s+Version="([^"]+)"',
-        re.IGNORECASE,
-    )
-    m = pattern.search(text)
-    if m:
-        return m.group(1)
+    try:
+        text = Path(project_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Could not read '{project_path}': {exc}")
 
-    pattern2 = re.compile(
-        rf'<PackageVersion\s+Include="{re.escape(package_id)}"\s+Version="([^"]+)"',
-        re.IGNORECASE,
-    )
-    m = pattern2.search(text)
-    if m:
-        return m.group(1)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return _resolve_installed_version_from_text(package_id, text)
 
-    id_pattern = re.compile(r"<PackageId>\s*([^<\s]+)\s*</PackageId>", re.IGNORECASE)
-    id_match = id_pattern.search(text)
-    if id_match and id_match.group(1).strip().lower() == package_id.lower():
-        version_match = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", text, re.IGNORECASE)
-        if version_match:
-            return version_match.group(1)
+    package_ref_version = None
+    package_version_version = None
+    first_package_id = None
+    first_version = None
+    for el in root.iter():
+        tag = _strip_ns(el.tag)
+        if tag == "PackageReference" and package_ref_version is None:
+            include = (el.attrib.get("Include") or "").strip()
+            version = (el.attrib.get("Version") or "").strip()
+            if include.lower() == package_id.lower() and version:
+                package_ref_version = version
+        elif tag == "PackageVersion" and package_version_version is None:
+            include = (el.attrib.get("Include") or "").strip()
+            version = (el.attrib.get("Version") or "").strip()
+            if include.lower() == package_id.lower() and version:
+                package_version_version = version
+        elif tag == "PackageId" and first_package_id is None:
+            first_package_id = (el.text or "").strip()
+        elif tag == "Version" and first_version is None:
+            first_version = (el.text or "").strip()
 
+    if package_ref_version:
+        return package_ref_version
+    if package_version_version:
+        return package_version_version
+    if first_package_id and first_package_id.lower() == package_id.lower() and first_version:
+        return first_version
     return None
 
 
@@ -259,6 +342,8 @@ def main():
     parser.add_argument("--installed-version", help="Version string already installed (skips csproj scanning)")
     parser.add_argument("--project-path", help=".csproj or Directory.Packages.props to scan for the installed version")
     parser.add_argument("--github-token", help="Optional token to raise the unauthenticated GitHub API rate limit")
+    parser.add_argument("--cache-dir", help="Override the cache root used for the GitHub tags cache (default: platform cache dir, see _http.default_cache_dir())")
+    parser.add_argument("--tags-cache-minutes", type=int, default=15, help="How long a fetched GitHub tag list stays cached before re-fetching (default 15; 0 disables caching)")
     parser.add_argument(
         "--docs-probe-path",
         help="Repo-relative path whose presence at docs_tag indicates the expected doc structure "
@@ -274,6 +359,8 @@ def main():
              "which has no such floor.",
     )
     args = parser.parse_args()
+
+    cache_dir = Path(args.cache_dir) if args.cache_dir else default_cache_dir()
 
     versions = fetch_nuget_versions(args.package_id)
     if not versions:
@@ -305,7 +392,7 @@ def main():
         # Something is installed - still resolve its own tag/docs so the
         # caller isn't left with nothing, even though there's no "latest
         # acceptable" to compare it against or recommend upgrading to yet.
-        tags = fetch_github_tags(args.repo, github_token=args.github_token)
+        tags = fetch_github_tags(args.repo, cache_dir=cache_dir, cache_minutes=args.tags_cache_minutes, github_token=args.github_token)
         installed_tag = find_matching_tag(installed, tags)
         docs_tag = installed_tag
         docs_structure = probe_docs_structure(args.repo, docs_tag, args.docs_probe_path, github_token=args.github_token)
@@ -331,7 +418,7 @@ def main():
         }, indent=2))
         return
 
-    tags = fetch_github_tags(args.repo, github_token=args.github_token)
+    tags = fetch_github_tags(args.repo, cache_dir=cache_dir, cache_minutes=args.tags_cache_minutes, github_token=args.github_token)
     matched_tag = find_matching_tag(latest, tags)
 
     installed_tag = find_matching_tag(installed, tags) if installed else None

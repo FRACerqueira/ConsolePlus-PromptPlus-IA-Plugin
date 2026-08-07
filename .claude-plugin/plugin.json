@@ -2,7 +2,7 @@
   "name": "consoleplus-promptplus",
   "displayName": "ConsolePlus + PromptPlus",
   "description": "Helps choose and implement the right ConsolePlus/PromptPlus control for .NET console applications - layer selection, non-interactive fallbacks, control disambiguation, and best-practice implementation, loaded on demand per control.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Fernando Cerqueira"
   },
