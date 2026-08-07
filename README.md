@@ -110,7 +110,11 @@ frontmatter carries the translated list. The `Bash→runCommands`, `Read→codeb
 `Grep`/`Glob→search` mappings were checked against Copilot's actual built-in tool set;
 `WebFetch→fetch` is this plugin's own best guess and hasn't been independently verified - if `fetch`
 gets rejected as an unknown tool in your Copilot version, check its current built-in tool list and
-adjust `copilot/agents/promptplus-auditor.agent.md`'s `tools:` line accordingly.
+adjust `copilot/agents/promptplus-auditor.agent.md`'s `tools:` line accordingly. This mapping only
+applies to the two `.agent.md` custom agents; `copilot/skills/select-promptplus-control/SKILL.md`'s
+own `allowed-tools` field follows a different, still-unsettled convention across Copilot surfaces
+(the Agent Skills spec marks it "Experimental", GitHub Copilot CLI and VS Code Copilot Chat
+disagree on its format/support) - see the caveat in that file for specifics.
 
 **No hook on Copilot.** Claude Code's console-project hook (`hooks/hooks.json` +
 `scripts/check_console_project.py`) has no Copilot equivalent - there's no hook mechanism to gate a
