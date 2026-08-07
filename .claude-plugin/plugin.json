@@ -6,8 +6,8 @@
   "author": {
     "name": "Fernando Cerqueira"
   },
-  "homepage": "https://github.com/FRACerqueira/ConsolePlus-PromptPlus-Claude-Plugin",
-  "repository": "https://github.com/FRACerqueira/ConsolePlus-PromptPlus-Claude-Plugin",
+  "homepage": "https://github.com/FRACerqueira/ConsolePlus-PromptPlus-IA-Plugin",
+  "repository": "https://github.com/FRACerqueira/ConsolePlus-PromptPlus-IA-Plugin",
   "license": "MIT",
   "keywords": ["console", "cli", "promptplus", "consoleplus", "dotnet", "interactive-controls"]
 }
